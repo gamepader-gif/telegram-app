@@ -1,0 +1,719 @@
+import html
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DB_FILE = SCRIPT_DIR / "chat_settings.json"
+
+
+def ensure_telegram_dependency():
+    if importlib.util.find_spec("telegram") is not None:
+        return
+
+    requirements_path = SCRIPT_DIR / "requirements.txt"
+    print("Модуль 'telegram' не найден. Пытаюсь установить зависимости автоматически...")
+
+    try:
+        if requirements_path.exists():
+            subprocess.check_call([
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-r",
+                str(requirements_path),
+            ])
+        else:
+            subprocess.check_call([
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "python-telegram-bot==21.4",
+            ])
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "Не удалось установить зависимости автоматически. Выполните вручную: "
+            "python -m pip install python-telegram-bot==21.4"
+        ) from exc
+
+
+ensure_telegram_dependency()
+
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.error import BadRequest, Conflict
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+
+def get_bot_token():
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+    if token:
+        return token.strip()
+
+    for filename in ("bot_token.txt", "token.txt"):
+        alt_file = SCRIPT_DIR / filename
+        if alt_file.exists():
+            file_token = alt_file.read_text(encoding="utf-8").strip()
+            if file_token:
+                return file_token
+
+    env_file = SCRIPT_DIR / ".env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            row = line.strip()
+            if not row or row.startswith("#") or "=" not in row:
+                continue
+            key, value = row.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key in {"TELEGRAM_BOT_TOKEN", "BOT_TOKEN"} and value:
+                return value
+
+    return None
+
+# ---------- storage ----------
+def load_db():
+    if DB_FILE.exists():
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"chats": {}, "global": {"employees": {}, "accounting": {}}}
+
+
+def save_db(db):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+
+
+def ensure_global(db):
+    if "global" not in db:
+        db["global"] = {}
+    if "employees" not in db["global"]:
+        db["global"]["employees"] = {}
+    if "accounting" not in db["global"]:
+        db["global"]["accounting"] = {}
+    if "daily_posts" not in db["global"]["accounting"]:
+        db["global"]["accounting"]["daily_posts"] = {}
+    if "admins" not in db["global"]:
+        db["global"]["admins"] = []
+    if "owner_id" not in db["global"]:
+        db["global"]["owner_id"] = None
+
+
+def get_user_role(db, user_id):
+    if not user_id:
+        return "guest"
+    user_id_text = str(user_id)
+    owner_id = db["global"].get("owner_id")
+    admins = set(str(x) for x in db["global"].get("admins", []))
+    employees = set(str(x) for x in db["global"].get("employees", {}).keys())
+
+    if owner_id and user_id_text == str(owner_id):
+        return "owner"
+    if user_id_text in admins:
+        return "admin"
+    if user_id_text in employees:
+        return "employee"
+    return "guest"
+
+
+def is_allowed_operator(role):
+    return role in {"owner", "admin", "employee"}
+
+
+def get_chat(db, chat_id):
+    chats = db.setdefault("chats", {})
+    chat = chats.setdefault(str(chat_id), {})
+    chat.setdefault("rate", None)
+    chat.setdefault("proc", None)
+    chat.setdefault("paid", 0.0)
+    chat.setdefault("paid_by_day", {})
+    chat.setdefault("transactions", [])
+    chat.setdefault("summary_message_id", None)
+    chat.setdefault("type", "client")
+    return chat
+
+
+def parse_number(text):
+    return float(text.replace(" ", "").replace(",", "."))
+
+
+def get_paid_for_utc_day(chat, utc_day_key):
+    paid_by_day = chat.get("paid_by_day", {})
+    if utc_day_key in paid_by_day:
+        return float(paid_by_day.get(utc_day_key, 0.0))
+    return 0.0
+
+
+# ---------- formatting ----------
+def make_message_link(chat_id, message_id):
+    text_id = str(chat_id)
+    if text_id.startswith("-100"):
+        return f"https://t.me/c/{text_id[4:]}/{message_id}"
+    return None
+
+
+def display_user(user):
+    if user and user.username:
+        return f"@{user.username}"
+    if user and user.full_name:
+        return user.full_name
+    return "пользователь"
+
+
+def render_chat_summary(chat):
+    txs = chat.get("transactions", [])
+    paid = get_paid_for_utc_day(chat, get_utc_day_key())
+
+    lines = []
+    total_rub = 0.0
+    total_usdt = 0.0
+
+    for i, tx in enumerate(txs, start=1):
+        total_rub += tx["amount"]
+        total_usdt += tx["usdt"]
+        row = (
+            f"{i}) {tx['time']}  {tx['amount']:.0f} / {tx['rate']:.2f} = {tx['usdt']:.2f} "
+            f"{tx['user']}"
+        )
+        safe_row = html.escape(row)
+        if tx.get("link"):
+            lines.append(f"<a href=\"{tx['link']}\">{safe_row}</a>")
+        else:
+            lines.append(safe_row)
+
+    rows_text = "\n".join(lines) if lines else "пока нет транзакций"
+    need = total_usdt - paid
+
+    return (
+        f"Количество транзакций: ({len(txs)})\n"
+        f"{rows_text}\n\n"
+        f"Сумма пополнений: {total_rub:.0f}\n\n"
+        f"Общая сумма: {total_usdt:.2f} USDT\n"
+        f"Выплачено: {paid:.2f} USDT\n"
+        f"Нужно выплатить: {need:.2f} USDT"
+    )
+
+
+def get_utc_day_key():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def get_accounting_paid_total(db, role):
+    utc_day_key = get_utc_day_key()
+    total_paid = 0.0
+    for chat in db.get("chats", {}).values():
+        chat_type = chat.get("type", "client")
+        paid = get_paid_for_utc_day(chat, utc_day_key)
+        if role == "employee" and chat_type == "staff":
+            total_paid += paid
+        if role == "admin" and chat_type != "staff":
+            total_paid += paid
+    return total_paid
+
+
+def render_accounting_summary(db, role, utc_day_key):
+    # role: employee/admin
+    rows = []
+    total_rub = 0.0
+    total_usdt = 0.0
+    count = 0
+
+    for chat_id, chat in db.get("chats", {}).items():
+        for tx in chat.get("transactions", []):
+            if tx.get("processor_role") != role:
+                continue
+            if tx.get("utc_day") != utc_day_key:
+                continue
+            count += 1
+            total_rub += tx["amount"]
+            total_usdt += tx["usdt"]
+            row = (
+                f"{count}) {tx['date']} {tx['time']}  {tx['amount']:.0f} / {tx['rate']:.2f} = "
+                f"{tx['usdt']:.2f}  {tx['user']}"
+            )
+            safe_row = html.escape(row)
+            if tx.get("link"):
+                rows.append(f"<a href=\"{tx['link']}\">{safe_row}</a>")
+            else:
+                rows.append(safe_row)
+
+    title = "Расчёты сотрудников" if role == "employee" else "Расчёты администратора"
+    body = "\n".join(rows) if rows else "пока нет транзакций"
+    paid_total = get_accounting_paid_total(db, role)
+
+    return (
+        f"<b>{title}</b>\n"
+        f"Количество транзакций: {count}\n"
+        f"{body}\n\n"
+        f"Сумма пополнений: {total_rub:.0f}\n"
+        f"Итого USDT: {total_usdt:.2f}\n"
+        f"Выплачено: {paid_total:.2f}"
+    )
+
+
+# ---------- updates ----------
+async def update_chat_summary(chat_id, context):
+    db = load_db()
+    chat = get_chat(db, chat_id)
+    text = render_chat_summary(chat)
+    msg_id = chat.get("summary_message_id")
+
+    if msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            try:
+                await context.bot.pin_chat_message(chat_id=chat_id, message_id=msg_id)
+            except Exception:
+                pass
+            return
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                try:
+                    await context.bot.pin_chat_message(chat_id=chat_id, message_id=msg_id)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+    chat["summary_message_id"] = sent.message_id
+    save_db(db)
+    try:
+        await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id)
+    except Exception:
+        pass
+
+
+async def update_accounting_posts(context):
+    db = load_db()
+    ensure_global(db)
+    accounting = db["global"]["accounting"]
+    acc_chat_id = accounting.get("chat_id")
+    if not acc_chat_id:
+        return
+
+    today_key = get_utc_day_key()
+    daily_posts = accounting.setdefault("daily_posts", {})
+    day_posts = daily_posts.setdefault(today_key, {})
+
+    employees_text = render_accounting_summary(db, "employee", today_key)
+    admins_text = render_accounting_summary(db, "admin", today_key)
+
+    # 1) employees post
+    emp_msg_id = day_posts.get("employee_message_id")
+    if emp_msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=acc_chat_id,
+                message_id=emp_msg_id,
+                text=employees_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                sent = await context.bot.send_message(
+                    chat_id=acc_chat_id,
+                    text=employees_text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                day_posts["employee_message_id"] = sent.message_id
+        except Exception:
+            sent = await context.bot.send_message(
+                chat_id=acc_chat_id,
+                text=employees_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            day_posts["employee_message_id"] = sent.message_id
+    else:
+        sent = await context.bot.send_message(
+            chat_id=acc_chat_id,
+            text=employees_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        day_posts["employee_message_id"] = sent.message_id
+
+    # 2) admins post
+    admin_msg_id = day_posts.get("admin_message_id")
+    if admin_msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=acc_chat_id,
+                message_id=admin_msg_id,
+                text=admins_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                sent = await context.bot.send_message(
+                    chat_id=acc_chat_id,
+                    text=admins_text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                day_posts["admin_message_id"] = sent.message_id
+        except Exception:
+            sent = await context.bot.send_message(
+                chat_id=acc_chat_id,
+                text=admins_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            day_posts["admin_message_id"] = sent.message_id
+    else:
+        sent = await context.bot.send_message(
+            chat_id=acc_chat_id,
+            text=admins_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        day_posts["admin_message_id"] = sent.message_id
+
+    save_db(db)
+
+
+# ---------- commands ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Бот запущен в этом чате")
+
+
+async def set_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    ensure_global(db)
+    role = get_user_role(db, update.effective_user.id if update.effective_user else None)
+    if not is_allowed_operator(role):
+        await update.message.reply_text("Только администратор или сотрудник может менять курс")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Пример: /rate 85")
+        return
+    try:
+        value = parse_number(context.args[0])
+        if value <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Курс должен быть числом больше 0")
+        return
+
+    chat = get_chat(db, update.message.chat_id)
+    chat["rate"] = value
+    save_db(db)
+
+    await update.message.reply_text(f"Курс сохранён: {value:g}")
+    await update_chat_summary(update.message.chat_id, context)
+
+
+async def set_proc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    ensure_global(db)
+    role = get_user_role(db, update.effective_user.id if update.effective_user else None)
+    if not is_allowed_operator(role):
+        await update.message.reply_text("Только администратор или сотрудник может менять процент")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Пример: /proc 15")
+        return
+    try:
+        value = parse_number(context.args[0])
+        if value < 0 or value >= 100:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Процент должен быть от 0 до 99.99")
+        return
+
+    chat = get_chat(db, update.message.chat_id)
+    chat["proc"] = value
+    save_db(db)
+
+    await update.message.reply_text(f"Процент сохранён: {value:g}%")
+    await update_chat_summary(update.message.chat_id, context)
+
+
+async def set_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    ensure_global(db)
+    role = get_user_role(db, update.effective_user.id if update.effective_user else None)
+    if role not in {"owner", "admin"}:
+        await update.message.reply_text("Только администратор может менять поле 'Выплачено'")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Пример: /pay 100")
+        return
+    try:
+        value = parse_number(context.args[0])
+        if value < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Сумма выплаты должна быть 0 или больше")
+        return
+
+    chat = get_chat(db, update.message.chat_id)
+    chat["paid"] = value
+    chat["paid_by_day"][get_utc_day_key()] = value
+    save_db(db)
+
+    await update.message.reply_text(f"Выплачено сохранено: {value:.2f} USDT")
+    await update_chat_summary(update.message.chat_id, context)
+    await update_accounting_posts(context)
+
+
+async def delete_tx(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    ensure_global(db)
+    role = get_user_role(db, update.effective_user.id if update.effective_user else None)
+    if role not in {"owner", "admin"}:
+        await update.message.reply_text("Только администратор может удалять записи")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Пример: /delete 2")
+        return
+
+    try:
+        index = int(context.args[0])
+        if index <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Номер должен быть целым числом: /delete 2")
+        return
+
+    chat = get_chat(db, update.message.chat_id)
+    txs = chat.get("transactions", [])
+
+    if index > len(txs):
+        await update.message.reply_text(f"Нет такой записи. Сейчас записей: {len(txs)}")
+        return
+
+    removed = txs.pop(index - 1)
+    save_db(db)
+
+    await update.message.reply_text(
+        f"Удалено: {removed['amount']:.0f} / {removed['rate']:.2f} = {removed['usdt']:.2f}"
+    )
+    await update_chat_summary(update.message.chat_id, context)
+    await update_accounting_posts(context)
+
+
+async def add_employee(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    ensure_global(db)
+    role = get_user_role(db, update.effective_user.id if update.effective_user else None)
+    if role not in {"owner", "admin"}:
+        await update.message.reply_text("Только администратор может добавлять сотрудников")
+        return
+
+    if not update.message.reply_to_message or not update.message.reply_to_message.from_user:
+        await update.message.reply_text("Используйте /add ответом на сообщение сотрудника")
+        return
+
+    user = update.message.reply_to_message.from_user
+    user_id = str(user.id)
+
+    db["global"]["employees"][user_id] = {
+        "username": user.username,
+        "name": user.full_name,
+    }
+
+    chat = get_chat(db, update.message.chat_id)
+    chat["type"] = "staff"
+    save_db(db)
+
+    await update.message.reply_text(f"Сотрудник добавлен: {display_user(user)}. Этот чат отмечен как чат сотрудников.")
+
+
+async def set_accounting_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    ensure_global(db)
+
+    role = get_user_role(db, update.effective_user.id if update.effective_user else None)
+    if role != "owner":
+        await update.message.reply_text("Команда /accounting доступна только владельцу бота")
+        return
+
+    db["global"]["accounting"]["chat_id"] = update.message.chat_id
+    save_db(db)
+
+    await update.message.reply_text("Бухгалтерская группа сохранена. Создаю/обновляю 2 поста...")
+    await update_accounting_posts(context)
+
+
+async def close_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    ensure_global(db)
+    role = get_user_role(db, update.effective_user.id if update.effective_user else None)
+    if role not in {"owner", "admin"}:
+        await update.message.reply_text("Только администратор может закрыть расчёты чата")
+        return
+
+    chat = get_chat(db, update.message.chat_id)
+    chat["transactions"] = []
+    chat["paid"] = 0.0
+    chat["paid_by_day"] = {}
+    save_db(db)
+
+    await update.message.reply_text("Чат закрыт: все пополнения и выплаты сброшены до 0")
+    await update_chat_summary(update.message.chat_id, context)
+    await update_accounting_posts(context)
+
+
+async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    ensure_global(db)
+
+    caller_id = str(update.effective_user.id) if update.effective_user else None
+    owner_id = db["global"].get("owner_id")
+
+    if owner_id is None:
+        db["global"]["owner_id"] = caller_id
+        save_db(db)
+        await update.message.reply_text("Вы назначены владельцем бота")
+        owner_id = caller_id
+
+    if caller_id != str(owner_id):
+        await update.message.reply_text("Только владелец может добавлять суб-администраторов")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Пример: /admin 123456789")
+        return
+
+    target_id = context.args[0].strip()
+    if not target_id.isdigit():
+        await update.message.reply_text("ID должен быть числом. Пример: /admin 123456789")
+        return
+
+    admins = set(str(x) for x in db["global"].get("admins", []))
+    admins.add(target_id)
+    db["global"]["admins"] = sorted(admins)
+    save_db(db)
+
+    await update.message.reply_text(f"Суб-администратор добавлен: {target_id}")
+
+
+# ---------- amount handler ----------
+async def calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.startswith("+"):
+        return
+
+    db = load_db()
+    ensure_global(db)
+
+    role = get_user_role(db, update.effective_user.id if update.effective_user else None)
+    if not is_allowed_operator(role):
+        await update.message.reply_text("Только администратор или сотрудник может добавлять суммы")
+        return
+
+    chat_id = update.message.chat_id
+    chat = get_chat(db, chat_id)
+
+    if chat.get("rate") is None:
+        await update.message.reply_text("Сначала задайте курс: /rate 85")
+        return
+    if chat.get("proc") is None:
+        await update.message.reply_text("Сначала задайте процент: /proc 15")
+        return
+
+    try:
+        amount = parse_number(text[1:])
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Сумма должна быть в формате +10000")
+        return
+
+    rate = float(chat["rate"])
+    proc = float(chat["proc"])
+    usdt = (amount / rate) * (1 - proc / 100)
+
+    sender = update.message.from_user
+    processor_role = "employee" if role == "employee" else "admin"
+
+    tx = {
+        "date": datetime.now().strftime("%d.%m.%Y"),
+        "time": datetime.now().strftime("%H:%M"),
+        "utc_day": get_utc_day_key(),
+        "amount": amount,
+        "rate": rate,
+        "usdt": usdt,
+        "user": display_user(sender),
+        "link": make_message_link(chat_id, update.message.message_id),
+        "chat_id": chat_id,
+        "processor_role": processor_role,
+        "chat_type": chat.get("type", "client"),
+    }
+
+    chat["transactions"].append(tx)
+    save_db(db)
+
+    await update.message.reply_text(
+        f"Добавил: {amount:.0f} / {rate:g} - {proc:g}% = {usdt:.2f} USDT ({'сотрудник' if processor_role == 'employee' else 'админ'})"
+    )
+
+    await update_chat_summary(chat_id, context)
+    await update_accounting_posts(context)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    if isinstance(context.error, Conflict):
+        print("Ошибка: запущено больше одного экземпляра бота с тем же токеном. Остановите лишний процесс и запустите только один.")
+        return
+
+    print(f"Ошибка бота: {context.error}")
+
+
+def main():
+    token = get_bot_token()
+    if not token:
+        print("Не найден токен бота.")
+        print("Сделайте один из вариантов:")
+        print("1) Переменная окружения TELEGRAM_BOT_TOKEN или BOT_TOKEN")
+        print("2) Файл bot_token.txt (или token.txt) рядом с bot.py")
+        print("3) Файл .env рядом с bot.py: TELEGRAM_BOT_TOKEN=ваш_токен")
+        return
+
+    app = ApplicationBuilder().token(token).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("rate", set_rate))
+    app.add_handler(CommandHandler("proc", set_proc))
+    app.add_handler(CommandHandler("pay", set_pay))
+    app.add_handler(CommandHandler("closed", close_chat))
+    app.add_handler(CommandHandler("admin", add_admin))
+    app.add_handler(CommandHandler("delete", delete_tx))
+    app.add_handler(CommandHandler("add", add_employee))
+    app.add_handler(CommandHandler("accounting", set_accounting_chat))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, calc))
+    app.add_error_handler(on_error)
+    print("Бот запущен")
+    try:
+        app.run_polling(drop_pending_updates=True)
+    except RuntimeError as exc:
+        print(f"Бот остановлен: {exc}")
+
+
+if __name__ == "__main__":
+    main()
