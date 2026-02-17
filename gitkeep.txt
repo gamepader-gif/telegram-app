@@ -472,11 +472,18 @@ async def set_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat = get_chat(db, update.message.chat_id)
-    chat["paid"] = value
-    chat["paid_by_day"][get_utc_day_key()] = value
+    utc_day_key = get_utc_day_key()
+    current_paid = get_paid_for_utc_day(chat, utc_day_key)
+    new_paid_total = current_paid + value
+
+    chat["paid"] = new_paid_total
+    chat["paid_by_day"][utc_day_key] = new_paid_total
     save_db(db)
 
-    await update.message.reply_text(f"Выплачено сохранено: {value:.2f} USDT")
+    await update.message.reply_text(
+        f"Выплата добавлена: +{value:.2f} USDT\n"
+        f"Итого выплачено за день: {new_paid_total:.2f} USDT"
+    )
     await update_chat_summary(update.message.chat_id, context)
     await update_accounting_posts(context)
 
