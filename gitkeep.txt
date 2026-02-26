@@ -4,11 +4,13 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_FILE = SCRIPT_DIR / "chat_settings.json"
+DATA_FILE = SCRIPT_DIR / "data.txt"
 
 
 def ensure_telegram_dependency():
@@ -78,15 +80,18 @@ def get_bot_token():
 
 # ---------- storage ----------
 def load_db():
-    if DB_FILE.exists():
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+    for path in (DATA_FILE, DB_FILE):
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
     return {"chats": {}, "global": {"employees": {}, "accounting": {}}}
 
 
 def save_db(db):
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
+    payload = json.dumps(db, ensure_ascii=False, indent=2)
+    for path in (DATA_FILE, DB_FILE):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(payload)
 
 
 def ensure_global(db):
@@ -133,7 +138,9 @@ def get_chat(db, chat_id):
     chat.setdefault("paid", 0.0)
     chat.setdefault("paid_by_day", {})
     chat.setdefault("transactions", [])
+    chat.setdefault("swap_pending_tx_id", None)
     chat.setdefault("summary_message_id", None)
+    chat.setdefault("summary_day", None)
     chat.setdefault("type", "client")
     return chat
 
@@ -147,6 +154,17 @@ def get_paid_for_utc_day(chat, utc_day_key):
     if utc_day_key in paid_by_day:
         return float(paid_by_day.get(utc_day_key, 0.0))
     return 0.0
+
+
+def tx_sort_key(tx):
+    if tx.get("utc_ts") is not None:
+        return float(tx["utc_ts"])
+
+    raw_dt = f"{tx.get('date', '')} {tx.get('time', '')}".strip()
+    try:
+        return datetime.strptime(raw_dt, "%d.%m.%Y %H:%M").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return 0.0
 
 
 # ---------- formatting ----------
@@ -166,8 +184,10 @@ def display_user(user):
 
 
 def render_chat_summary(chat):
-    txs = chat.get("transactions", [])
-    paid = get_paid_for_utc_day(chat, get_utc_day_key())
+    utc_day_key = get_utc_day_key()
+    txs = [tx for tx in chat.get("transactions", []) if tx.get("utc_day") == utc_day_key]
+    txs.sort(key=tx_sort_key)
+    paid = get_paid_for_utc_day(chat, utc_day_key)
 
     lines = []
     total_rub = 0.0
@@ -219,28 +239,33 @@ def get_accounting_paid_total(db, role):
 def render_accounting_summary(db, role, utc_day_key):
     # role: employee/admin
     rows = []
+    collected = []
     total_rub = 0.0
     total_usdt = 0.0
     count = 0
 
-    for chat_id, chat in db.get("chats", {}).items():
+    for chat in db.get("chats", {}).values():
         for tx in chat.get("transactions", []):
             if tx.get("processor_role") != role:
                 continue
             if tx.get("utc_day") != utc_day_key:
                 continue
-            count += 1
-            total_rub += tx["amount"]
-            total_usdt += tx["usdt"]
-            row = (
-                f"{count}) {tx['date']} {tx['time']}  {tx['amount']:.0f} / {tx['rate']:.2f} = "
-                f"{tx['usdt']:.2f}  {tx['user']}"
-            )
-            safe_row = html.escape(row)
-            if tx.get("link"):
-                rows.append(f"<a href=\"{tx['link']}\">{safe_row}</a>")
-            else:
-                rows.append(safe_row)
+            collected.append(tx)
+
+    collected.sort(key=tx_sort_key)
+    for tx in collected:
+        count += 1
+        total_rub += tx["amount"]
+        total_usdt += tx["usdt"]
+        row = (
+            f"{count}) {tx['date']} {tx['time']}  {tx['amount']:.0f} / {tx['rate']:.2f} = "
+            f"{tx['usdt']:.2f}  {tx['user']}"
+        )
+        safe_row = html.escape(row)
+        if tx.get("link"):
+            rows.append(f"<a href=\"{tx['link']}\">{safe_row}</a>")
+        else:
+            rows.append(safe_row)
 
     title = "Расчёты сотрудников" if role == "employee" else "Расчёты администратора"
     body = "\n".join(rows) if rows else "пока нет транзакций"
@@ -260,6 +285,19 @@ def render_accounting_summary(db, role, utc_day_key):
 async def update_chat_summary(chat_id, context):
     db = load_db()
     chat = get_chat(db, chat_id)
+    today_key = get_utc_day_key()
+
+    if chat.get("summary_day") != today_key:
+        old_msg_id = chat.get("summary_message_id")
+        if old_msg_id:
+            try:
+                await context.bot.unpin_chat_message(chat_id=chat_id, message_id=old_msg_id)
+            except Exception:
+                pass
+        chat["summary_message_id"] = None
+        chat["summary_day"] = today_key
+        save_db(db)
+
     text = render_chat_summary(chat)
     msg_id = chat.get("summary_message_id")
 
@@ -294,6 +332,7 @@ async def update_chat_summary(chat_id, context):
         disable_web_page_preview=True,
     )
     chat["summary_message_id"] = sent.message_id
+    chat["summary_day"] = today_key
     save_db(db)
     try:
         await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id)
@@ -311,6 +350,18 @@ async def update_accounting_posts(context):
 
     today_key = get_utc_day_key()
     daily_posts = accounting.setdefault("daily_posts", {})
+    last_day_key = accounting.get("last_day_key")
+
+    if last_day_key and last_day_key != today_key:
+        old_posts = daily_posts.get(last_day_key, {})
+        for old_key in ("employee_message_id", "admin_message_id"):
+            old_msg_id = old_posts.get(old_key)
+            if old_msg_id:
+                try:
+                    await context.bot.unpin_chat_message(chat_id=acc_chat_id, message_id=old_msg_id)
+                except Exception:
+                    pass
+
     day_posts = daily_posts.setdefault(today_key, {})
 
     employees_text = render_accounting_summary(db, "employee", today_key)
@@ -352,6 +403,14 @@ async def update_accounting_posts(context):
             disable_web_page_preview=True,
         )
         day_posts["employee_message_id"] = sent.message_id
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=acc_chat_id,
+            message_id=day_posts["employee_message_id"],
+            disable_notification=True,
+        )
+    except Exception:
+        pass
 
     # 2) admins post
     admin_msg_id = day_posts.get("admin_message_id")
@@ -389,6 +448,16 @@ async def update_accounting_posts(context):
             disable_web_page_preview=True,
         )
         day_posts["admin_message_id"] = sent.message_id
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=acc_chat_id,
+            message_id=day_posts["admin_message_id"],
+            disable_notification=True,
+        )
+    except Exception:
+        pass
+
+    accounting["last_day_key"] = today_key
 
     save_db(db)
 
@@ -525,6 +594,45 @@ async def delete_tx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_accounting_posts(context)
 
 
+async def swap_tx(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    ensure_global(db)
+    role = get_user_role(db, update.effective_user.id if update.effective_user else None)
+    if role not in {"owner", "admin"}:
+        await update.message.reply_text("Только администратор может менять курс/процент у транзакции")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Пример: /swap 1")
+        return
+
+    try:
+        index = int(context.args[0])
+        if index <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Номер должен быть целым числом: /swap 1")
+        return
+
+    chat = get_chat(db, update.message.chat_id)
+    utc_day_key = get_utc_day_key()
+    day_txs = [tx for tx in chat.get("transactions", []) if tx.get("utc_day") == utc_day_key]
+    day_txs.sort(key=tx_sort_key)
+
+    if index > len(day_txs):
+        await update.message.reply_text(f"Нет такой транзакции за сегодня. Сейчас транзакций: {len(day_txs)}")
+        return
+
+    target_tx = day_txs[index - 1]
+    chat["swap_pending_tx_id"] = target_tx.get("utc_ts")
+    save_db(db)
+
+    await update.message.reply_text(
+        "Установите нужный proc и rate одним сообщением:\n"
+        "Пример: 17 86"
+    )
+
+
 async def add_employee(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = load_db()
     ensure_global(db)
@@ -624,19 +732,68 @@ async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- amount handler ----------
 async def calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    if not text.startswith("+"):
-        return
-
     db = load_db()
     ensure_global(db)
+
+    chat_id = update.message.chat_id
+    chat = get_chat(db, chat_id)
+
+    pending_tx_id = chat.get("swap_pending_tx_id")
+    if pending_tx_id is not None:
+        role = get_user_role(db, update.effective_user.id if update.effective_user else None)
+        if role not in {"owner", "admin"}:
+            await update.message.reply_text("Только администратор может завершить /swap")
+            return
+
+        parts = text.replace(",", ".").split()
+        if len(parts) != 2:
+            await update.message.reply_text("Нужно 2 числа: proc и rate. Пример: 17 86")
+            return
+
+        try:
+            new_proc = parse_number(parts[0])
+            new_rate = parse_number(parts[1])
+            if new_proc < 0 or new_proc >= 100 or new_rate <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Неверные значения. Пример: 17 86")
+            return
+
+        target_tx = None
+        for tx in chat.get("transactions", []):
+            if tx.get("utc_ts") == pending_tx_id:
+                target_tx = tx
+                break
+
+        if not target_tx:
+            chat["swap_pending_tx_id"] = None
+            save_db(db)
+            await update.message.reply_text("Не удалось найти выбранную транзакцию. Повторите /swap <номер>")
+            return
+
+        amount = float(target_tx["amount"])
+        new_usdt = (amount / new_rate) * (1 - new_proc / 100)
+        target_tx["rate"] = new_rate
+        target_tx["usdt"] = new_usdt
+        target_tx["proc"] = new_proc
+
+        chat["swap_pending_tx_id"] = None
+        save_db(db)
+
+        await update.message.reply_text(
+            f"Транзакция обновлена: proc {new_proc:g}%, rate {new_rate:g}, итог {new_usdt:.2f} USDT"
+        )
+        await update_chat_summary(chat_id, context)
+        await update_accounting_posts(context)
+        return
+
+    if not text.startswith("+"):
+        return
 
     role = get_user_role(db, update.effective_user.id if update.effective_user else None)
     if not is_allowed_operator(role):
         await update.message.reply_text("Только администратор или сотрудник может добавлять суммы")
         return
-
-    chat_id = update.message.chat_id
-    chat = get_chat(db, chat_id)
 
     if chat.get("rate") is None:
         await update.message.reply_text("Сначала задайте курс: /rate 85")
@@ -664,6 +821,7 @@ async def calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "date": datetime.now().strftime("%d.%m.%Y"),
         "time": datetime.now().strftime("%H:%M"),
         "utc_day": get_utc_day_key(),
+        "utc_ts": time.time(),
         "amount": amount,
         "rate": rate,
         "usdt": usdt,
@@ -711,6 +869,7 @@ def main():
     app.add_handler(CommandHandler("closed", close_chat))
     app.add_handler(CommandHandler("admin", add_admin))
     app.add_handler(CommandHandler("delete", delete_tx))
+    app.add_handler(CommandHandler("swap", swap_tx))
     app.add_handler(CommandHandler("add", add_employee))
     app.add_handler(CommandHandler("accounting", set_accounting_chat))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, calc))
