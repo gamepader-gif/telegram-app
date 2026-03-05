@@ -578,13 +578,27 @@ async def delete_tx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat = get_chat(db, update.message.chat_id)
-    txs = chat.get("transactions", [])
+    utc_day_key = get_utc_day_key()
+    day_txs = [tx for tx in chat.get("transactions", []) if tx.get("utc_day") == utc_day_key]
+    day_txs.sort(key=tx_sort_key)
 
-    if index > len(txs):
-        await update.message.reply_text(f"Нет такой записи. Сейчас записей: {len(txs)}")
+    if index > len(day_txs):
+        await update.message.reply_text(f"Нет такой записи за сегодня. Сейчас записей: {len(day_txs)}")
         return
 
-    removed = txs.pop(index - 1)
+    target_tx = day_txs[index - 1]
+    txs = chat.get("transactions", [])
+
+    removed = None
+    for i, tx in enumerate(txs):
+        if tx is target_tx:
+            removed = txs.pop(i)
+            break
+
+    if removed is None:
+        await update.message.reply_text("Не удалось удалить запись. Повторите команду /delete")
+        return
+
     save_db(db)
 
     await update.message.reply_text(
