@@ -7123,15 +7123,4 @@
           "processor_role": "employee",
           "chat_type": "staff"
         },
-        {
-          "date": "14.03.2026",
-          "time": "16:29",
-          "utc_day": "2026-03-14",
-          "utc_ts": 1773505767.6622722,
-          "amount": 20000.0,
-          "rate": 84.0,
-          "usdt": 195.23809523809527,
-          "user": "@Bismutt1",
-          "link": "https://t.me/c/3796743626/582",
-          "chat_id": -1003796743626,
-          "processor_role": "employee"
+        
